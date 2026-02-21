@@ -72,6 +72,9 @@ class ModbusMaster
     ModbusMaster();
    
     void begin(uint8_t, Stream &serial);
+    void begin(uint8_t, Stream &serial, uint32_t baud, uint8_t dataBits = 8, uint8_t parity = 0, uint8_t stopBits = 1);
+    void setTimeouts(uint32_t baud, uint8_t dataBits = 8, uint8_t parity = 0, uint8_t stopBits = 1);
+    void setResponseTimeout(uint16_t timeoutMs);
     void idle(void (*)());
     void preTransmission(void (*)());
     void postTransmission(void (*)());
@@ -233,7 +236,18 @@ class ModbusMaster
     uint16_t* rxBuffer; // from Wire.h -- need to clean this up Rx
     uint8_t _u8ResponseBufferIndex;
     uint8_t _u8ResponseBufferLength;
-    
+
+    uint32_t _u32Baud;
+    uint8_t _u8DataBits;
+    uint8_t _u8Parity;
+    uint8_t _u8StopBits;
+    uint32_t _u32T1_5;
+    uint32_t _u32T3_5;
+    uint16_t _u16ResponseTimeout;
+    uint32_t _u32LastActivityTime;
+
+    void updateTimeouts();
+
     // Modbus function codes for bit access
     static const uint8_t ku8MBReadCoils                  = 0x01; ///< Modbus function 0x01 Read Coils
     static const uint8_t ku8MBReadDiscreteInputs         = 0x02; ///< Modbus function 0x02 Read Discrete Inputs
