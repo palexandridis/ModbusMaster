@@ -46,6 +46,15 @@ ModbusMaster::ModbusMaster(void)
   _idle = 0;
   _preTransmission = 0;
   _postTransmission = 0;
+  _u32Baud = 9600;
+  _u8DataBits = 8;
+  _u8Parity = 0;
+  _u8StopBits = 1;
+  _u16ResponseTimeout = ku16MBResponseTimeout;
+  _u32T1_5 = 0;
+  _u32T3_5 = 0;
+  _u32LastActivityTime = 0;
+  updateTimeouts();
 }
 
 /**
@@ -60,16 +69,67 @@ Call once class has been instantiated, typically within setup().
 */
 void ModbusMaster::begin(uint8_t slave, Stream &serial)
 {
+  begin(slave, serial, _u32Baud, _u8DataBits, _u8Parity, _u8StopBits);
+}
+
+void ModbusMaster::begin(uint8_t slave, Stream &serial, uint32_t baud, uint8_t dataBits,
+  uint8_t parity, uint8_t stopBits)
+{
 //  txBuffer = (uint16_t*) calloc(ku8MaxBufferSize, sizeof(uint16_t));
   _u8MBSlave = slave;
   _serial = &serial;
   _u8TransmitBufferIndex = 0;
   u16TransmitBufferLength = 0;
+  setTimeouts(baud, dataBits, parity, stopBits);
   
 #if __MODBUSMASTER_DEBUG__
   pinMode(__MODBUSMASTER_DEBUG_PIN_A__, OUTPUT);
   pinMode(__MODBUSMASTER_DEBUG_PIN_B__, OUTPUT);
 #endif
+}
+
+void ModbusMaster::setTimeouts(uint32_t baud, uint8_t dataBits, uint8_t parity, uint8_t stopBits)
+{
+  _u32Baud = baud;
+  _u8DataBits = dataBits;
+  _u8Parity = parity;
+  _u8StopBits = stopBits;
+  updateTimeouts();
+}
+
+void ModbusMaster::setResponseTimeout(uint16_t timeoutMs)
+{
+  _u16ResponseTimeout = timeoutMs;
+}
+
+void ModbusMaster::updateTimeouts()
+{
+  if (_u32Baud == 0)
+  {
+    _u32T1_5 = 0;
+    _u32T3_5 = 0;
+    return;
+  }
+
+  if (_u32Baud > 19200)
+  {
+    _u32T1_5 = 750;
+    _u32T3_5 = 1750;
+    return;
+  }
+
+  uint8_t u8BitsPerChar = 1 + _u8DataBits + _u8StopBits + (_u8Parity ? 1 : 0);
+  uint32_t u32CharTimeUs = (1000000UL * u8BitsPerChar + (_u32Baud - 1)) / _u32Baud;
+  _u32T1_5 = (u32CharTimeUs * 15UL) / 10UL;
+  _u32T3_5 = (u32CharTimeUs * 35UL) / 10UL;
+  if (_u32T1_5 == 0)
+  {
+    _u32T1_5 = 1;
+  }
+  if (_u32T3_5 == 0)
+  {
+    _u32T3_5 = 1;
+  }
 }
 
 
@@ -603,7 +663,10 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   uint8_t u8ModbusADUSize = 0;
   uint8_t i, u8Qty;
   uint16_t u16CRC;
-  uint32_t u32StartTime;
+  uint32_t u32ResponseStartMs;
+  uint32_t u32LastByteUs = 0;
+  bool bFrameStarted = false;
+  bool bFrameDone = false;
   uint8_t u8BytesLeft = 8;
   uint8_t u8MBStatus = ku8MBSuccess;
   
@@ -704,6 +767,18 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   // flush receive buffer before transmitting request
   while (_serial->read() != -1);
 
+  // ensure inter-frame silent interval before transmitting
+  if (_u32T3_5 && _u32LastActivityTime)
+  {
+    while ((uint32_t)(micros() - _u32LastActivityTime) < _u32T3_5)
+    {
+      if (_idle)
+      {
+        _idle();
+      }
+    }
+  }
+
   // transmit request
   if (_preTransmission)
   {
@@ -716,14 +791,15 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   
   u8ModbusADUSize = 0;
   _serial->flush();    // flush transmit buffer
+  _u32LastActivityTime = micros();
   if (_postTransmission)
   {
     _postTransmission();
   }
   
   // loop until we run out of time or bytes, or an error occurs
-  u32StartTime = millis();
-  while (u8BytesLeft && !u8MBStatus)
+  u32ResponseStartMs = millis();
+  while (!u8MBStatus)
   {
     if (_serial->available())
     {
@@ -731,7 +807,17 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
       digitalWrite(__MODBUSMASTER_DEBUG_PIN_A__, true);
 #endif
       u8ModbusADU[u8ModbusADUSize++] = _serial->read();
-      u8BytesLeft--;
+      if (u8BytesLeft)
+      {
+        u8BytesLeft--;
+      }
+      bFrameStarted = true;
+      u32LastByteUs = micros();
+      _u32LastActivityTime = u32LastByteUs;
+      if (u8BytesLeft == 0)
+      {
+        bFrameDone = true;
+      }
 #if __MODBUSMASTER_DEBUG__
       digitalWrite(__MODBUSMASTER_DEBUG_PIN_A__, false);
 #endif
@@ -796,10 +882,32 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
           u8BytesLeft = 5;
           break;
       }
+
+      bFrameDone = (u8BytesLeft == 0);
     }
-    if ((millis() - u32StartTime) > ku16MBResponseTimeout)
+
+    if (!bFrameStarted)
     {
-      u8MBStatus = ku8MBResponseTimedOut;
+      if ((millis() - u32ResponseStartMs) > _u16ResponseTimeout)
+      {
+        u8MBStatus = ku8MBResponseTimedOut;
+      }
+    }
+    else
+    {
+      if (!bFrameDone && _u32T1_5 && (uint32_t)(micros() - u32LastByteUs) > _u32T1_5)
+      {
+        u8MBStatus = ku8MBResponseTimedOut;
+      }
+      else if (bFrameDone && _u32T3_5 && (uint32_t)(micros() - u32LastByteUs) > _u32T3_5)
+      {
+        break;
+      }
+
+      if ((millis() - u32ResponseStartMs) > _u16ResponseTimeout)
+      {
+        u8MBStatus = ku8MBResponseTimedOut;
+      }
     }
   }
   
@@ -874,3 +982,4 @@ uint8_t ModbusMaster::ModbusMasterTransaction(uint8_t u8MBFunction)
   _u8ResponseBufferIndex = 0;
   return u8MBStatus;
 }
+
